@@ -1,0 +1,13 @@
+- input_img: example_images/bear.png
+  source_prompt: A large brown bear walking through a stream of water.
+    The stream appears to be shallow, as the bear is able to walk through it without any difficulty.
+
+  target_prompts:
+    - A large brown bear walking on the grass
+    - A large brown bear standing on its hind legs
+    - A large brown bear sitting on the snow and looking face forward
+
+  target_codes:
+    - grass
+    - standing
+    - snow
