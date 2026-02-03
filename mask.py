@@ -147,12 +147,12 @@ def create_mask(init_img, rp, qp, n=20, s=0.5):
 
 if __name__ == "__main__":
 
-    path_img = "C:\\Users\\JALAL\\OneDrive\\Documents\\FocusFlow\\FlowEdit\\example_images\\bear.png"
+    path_img = "./FlowEdit/example_images/bear.png"
     init_img = load_image(path_img)
 
     rp = "A brown bear walking through a stream of water."
 
-    qp = "A brown bear standing on water"
+    qp = "A brown bear sitting on the snow and looking face forward"
 
     print("creating mask...")
     mask_bin = create_mask(init_img=init_img, rp=[rp], qp=[qp], n=10)
