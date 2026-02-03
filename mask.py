@@ -83,108 +83,85 @@ def predict_eps_cfg(unet, scheduler, latents_t, t, cond_emb, uncond_emb, guidanc
     return eps  # shape: (1, C, H, W)
 
 
-@torch.no_grad()
-def create_diffedit_mask(
-    init_img_pil,
-    ref_prompt: str,
-    query_prompt: str,
-    text_enc,
-    pil_to_latents,
-    unet,
-    scheduler,
-    steps: int = 50,
-    noise_strength: float = 0.5,     # "50% noise" per paper
-    n: int = 10,                     # paper default
-    guidance_scale: float = 5.0,     # paper default in ImageNet ablation
-    clip_q: float = 0.99,            # percentile clipping for "remove extreme values" (not specified in paper)
-    threshold: float = 0.5,          # paper default after rescale to [0,1]
-    device: str = "cuda",
-):
+def prompt_2_img_i2i_fast(prompts, init_img, g=7.5, seed=100, strength =0.5, steps=50, dim=512):
     """
-    Returns:
-      mask_soft: float tensor in [0,1], shape (H, W) in latent resolution
-      mask_bin : uint8 tensor {0,1}, shape (H, W)
+    Diffusion process to convert prompt to image
     """
+    # Converting textual prompts to embedding
+    text = text_enc(prompts) 
+    
+    # Adding an unconditional prompt , helps in the generation process
+    uncond =  text_enc([""], text.shape[1])
+    emb = torch.cat([uncond, text])
+    
+    # Setting the seed
+    if seed: torch.manual_seed(seed)
+    
+    # Setting number of steps in scheduler
+    scheduler.set_timesteps(steps)
+    
+    # Convert the seed image to latent
+    init_latents = pil_to_latents(init_img)
+    
+    # Figuring initial time step based on strength
+    init_timestep = int(steps * strength) 
+    timesteps = scheduler.timesteps[-init_timestep]
+    timesteps = torch.tensor([timesteps], device="cuda")
+    
+    # Adding noise to the latents 
+    noise = torch.randn(init_latents.shape, generator=None, device="cuda", dtype=init_latents.dtype)
+    init_latents = scheduler.add_noise(init_latents, noise, timesteps)
+    latents = init_latents
+    
+    # We need to scale the i/p latents to match the variance
+    inp = scheduler.scale_model_input(torch.cat([latents] * 2), timesteps)
+    # Predicting noise residual using U-Net
+    with torch.no_grad(): u,t = unet(inp, timesteps, encoder_hidden_states=emb).sample.chunk(2)
+         
+    # Performing Guidance
+    pred = u + g*(t-u)
 
-    # --- Encode prompts ---
-    cond_ref = text_enc([ref_prompt]).to(device)
-    cond_q   = text_enc([query_prompt]).to(device)
-    uncond   = text_enc([""], cond_ref.shape[1]).to(device)  # matches your usage
+    # Zero shot prediction
+    latents = scheduler.step(pred, timesteps, latents).pred_original_sample
+    
+    return latents.detach().cpu()
 
-    # --- Scheduler timesteps ---
-    scheduler.set_timesteps(steps, device=device)
 
-    # Map noise_strength to an img2img-style starting timestep
-    init_timestep = int(steps * noise_strength)
-    init_timestep = max(1, min(init_timestep, steps))
-    t_start = steps - init_timestep
-    t = scheduler.timesteps[t_start]
-    if not torch.is_tensor(t):
-        t = torch.tensor(t, device=device)
-    if t.ndim == 0:
-        t = t[None]  # shape (1,)
-
-    # --- Latents of input image ---
-    latents0 = pil_to_latents(init_img_pil).to(device)  # shape (1, C, H, W)
-
-    # --- Accumulate spatial difference over n noise draws ---
-    acc = torch.zeros((latents0.shape[-2], latents0.shape[-1]), device=device)
-
-    for i in range(n):
-        # different noise each time (paper: average over n input noises)
-        gen = torch.Generator(device=device).manual_seed(100 * i)
-        noise = torch.randn(latents0.shape, generator=gen, device=device, dtype=latents0.dtype)
-
-        latents_t = scheduler.add_noise(latents0, noise, t)
-
-        eps_ref = predict_eps_cfg(unet, scheduler, latents_t, t, cond_ref, uncond, guidance_scale)
-        eps_q   = predict_eps_cfg(unet, scheduler, latents_t, t, cond_q,   uncond, guidance_scale)
-
-        # spatial diff map (paper doesn't specify norm; abs-mean is a standard choice)
-        diff_map = (eps_ref - eps_q).abs().mean(dim=1).squeeze(0)  # (H, W)
-
-        acc += diff_map
-
-    mask = acc / float(n)
-
-    # --- "remove extreme values" (paper mentions it but doesn't specify how) ---
-    # Percentile clipping (explicit + stable).
-    hi = torch.quantile(mask.flatten(), clip_q)
-    mask = torch.clamp(mask, max=hi)
-
-    # --- Rescale to [0,1] then binarize at 0.5 (paper default) ---
-    mmin, mmax = mask.min(), mask.max()
-    mask_soft = (mask - mmin) / (mmax - mmin + 1e-8)
-    mask_bin = (mask_soft >= threshold).to(torch.uint8)
-
-    return mask_soft.detach().cpu(), mask_bin.detach().cpu()
-
+def create_mask(init_img, rp, qp, n=20, s=0.5):
+    diff = {}
+    
+    for idx in range(n):
+        orig_noise = prompt_2_img_i2i_fast(prompts=rp, init_img=init_img, strength=s, seed = 100*idx)[0]
+        query_noise = prompt_2_img_i2i_fast(prompts=qp, init_img=init_img, strength=s, seed = 100*idx)[0]
+        diff[idx] = (np.array(orig_noise)-np.array(query_noise))
+    
+    mask = np.zeros_like(diff[0])
+    
+    for idx in range(n):
+        mask += np.abs(diff[idx])  
+        
+    mask = mask.mean(0)
+    mask = (mask - mask.mean()) / np.std(mask)
+    
+    return (mask > 0).astype("uint8")
 
 if __name__ == "__main__":
 
     path_img = "C:\\Users\\JALAL\\OneDrive\\Documents\\FocusFlow\\FlowEdit\\example_images\\bear.png"
     init_img = load_image(path_img)
 
-    rp = "A  brown bear "
+    rp = "A brown bear walking through a stream of water."
 
-    qp = "A  panda  "
+    qp = "A brown bear standing on water"
 
-    mask_soft, mask_bin = create_diffedit_mask(
-            init_img_pil=init_img,
-            ref_prompt=rp,
-            query_prompt=qp,
-            text_enc=text_enc,
-            pil_to_latents=pil_to_latents,
-            unet=unet,
-            scheduler=scheduler
-         )
-
+    print("creating mask...")
+    mask_bin = create_mask(init_img=init_img, rp=[rp], qp=[qp], n=10)
 
     plt.imshow(init_img)
     plt.imshow(
-        Image.fromarray((mask_bin.numpy() * 255).astype('uint8')).resize((512,512)),
+        Image.fromarray((mask_bin * 255).astype('uint8')).resize((512,512)),
         cmap='cividis', 
-        alpha=0.9*(np.array(Image.fromarray((mask_bin.numpy() * 255).astype('uint8')).resize((512,512))) > 0)  
+        alpha=0.9*(np.array(Image.fromarray((mask_bin * 255).astype('uint8')).resize((512,512))) > 0)  
     )
     plt.axis('off')
     plt.show()
